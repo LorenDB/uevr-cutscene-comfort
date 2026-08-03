@@ -1,0 +1,26 @@
+# CutsceneComfort defaults. The real file belongs next to the UEVR game
+# profile, not beside the DLL.
+zero_offsets=1
+smooth_restore=1
+restore_seconds=1.5
+flatten_pitch=1
+game_aim=0
+pause_uobject_hook=1
+loose_detection=0
+show_ui=1
+ui_hotkey_vk=118
+theater_frame=0
+frame_lock_aspect=0
+frame_width_m=2.4
+frame_height_m=1.35
+frame_distance_m=2.0
+frame_feather_m=0.10
+frame_corner_radius_m=0.0
+frame_curvature=0.0
+frame_surround_red=0.0
+frame_surround_green=0.0
+frame_surround_blue=0.0
+frame_opacity=1.0
+frame_fade_seconds=0.6
+frame_single_view=0
+simulate_cutscene=0
