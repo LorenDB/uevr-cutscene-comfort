@@ -12,6 +12,12 @@
 // the player sees the shot as intended. When gameplay takes the camera back,
 // everything is eased back to how it was.
 //
+// Optionally, the same detection fades the headset view through black and
+// hands the shot to UEVR's 2D screen: a fixed camera on a quad in front of
+// the player. The default keeps the per-eye stereo portal. Flat 2D feeds
+// both eyes one picture. The screen fades back to tracked VR when the
+// shot ends.
+//
 // A note on the detection choice: an earlier version of this idea checked
 // whether a CineCameraActor existed anywhere in the level. Plenty of games
 // keep one loaded at all times, so that fires constantly. Asking the camera
@@ -37,6 +43,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
@@ -53,6 +60,7 @@
 
 #include "uevr/Plugin.hpp"
 
+#include "UnvrTransition.hpp"
 #include "Vignette.hpp"
 #include "VignetteD3D11.hpp"
 
@@ -138,6 +146,7 @@ public:
             find_engine_classes(delta);
             if (m_startup_recovery_done && m_startup_recovery_safe) {
                 poll_cutscene_state(delta);
+                advance_unvr(delta);
             }
             advance_restore(delta);
 
@@ -261,6 +270,48 @@ public:
 
         ImGui_ImplWin32_Shutdown();
         m_imgui_ready = false;
+    }
+
+    // Flat 2D collapses UEVR's remaining eye separation after the 2D screen
+    // has stopped applying headset pose. The stereo portal leaves this alone,
+    // so each eye keeps the offset UEVR already wrote.
+    void on_post_calculate_stereo_view_offset(UEVR_StereoRenderingDeviceHandle, int view_index, float,
+        UEVR_Vector3f* position, UEVR_Rotatorf*, bool is_double) override {
+        if (!m_unvr_flatten_stereo.load() || position == nullptr || view_index < 0) {
+            m_mono_anchor.valid = false;
+            return;
+        }
+
+        if (m_mono_anchor.valid && m_mono_anchor.view_index != view_index) {
+            if (m_mono_anchor.is_double == is_double) {
+                if (is_double) {
+                    auto* wide = reinterpret_cast<UEVR_Vector3d*>(position);
+                    wide->x = m_mono_anchor.x;
+                    wide->y = m_mono_anchor.y;
+                    wide->z = m_mono_anchor.z;
+                } else {
+                    position->x = static_cast<float>(m_mono_anchor.x);
+                    position->y = static_cast<float>(m_mono_anchor.y);
+                    position->z = static_cast<float>(m_mono_anchor.z);
+                }
+            }
+            m_mono_anchor.valid = false;
+            return;
+        }
+
+        m_mono_anchor.valid = true;
+        m_mono_anchor.view_index = view_index;
+        m_mono_anchor.is_double = is_double;
+        if (is_double) {
+            const auto* wide = reinterpret_cast<const UEVR_Vector3d*>(position);
+            m_mono_anchor.x = wide->x;
+            m_mono_anchor.y = wide->y;
+            m_mono_anchor.z = wide->z;
+        } else {
+            m_mono_anchor.x = position->x;
+            m_mono_anchor.y = position->y;
+            m_mono_anchor.z = position->z;
+        }
     }
 
     bool on_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) override {
@@ -554,7 +605,13 @@ private:
         // later clean launch can reload the temporary cutscene values after
         // our own journal has already been cleared.
         if (had_parked) {
-            API::VR::save_config();
+            if (m_unvr_hold.active) {
+                // The fixed screen still owns UEVR settings. Writing config
+                // now would persist that temporary screen.
+                m_pending_uevr_save = true;
+            } else {
+                API::VR::save_config();
+            }
         }
 
         m_baseline = {};
@@ -602,6 +659,15 @@ private:
         // For alternate frame rendering or flat 2D output, where the
         // backbuffer holds one view instead of two side by side.
         bool frame_single_view{false};
+
+        // Fixed screen. Off by default. When on, a cutscene fades through
+        // black into UEVR's 2D screen and fades back afterwards.
+        bool unvr_enabled{false};
+        bool unvr_stereo{true};
+        bool unvr_follow_view{true};
+        float unvr_distance_m{2.0f};
+        float unvr_height_m{1.5f};
+        float unvr_fade_seconds{0.15f};
     };
 
     std::filesystem::path settings_path() {
@@ -651,6 +717,7 @@ private:
         }
 
         ParkedState parked{};
+        UnvrJournal unvr{};
 
         std::string line{};
         while (std::getline(file, line)) {
@@ -686,6 +753,49 @@ private:
             else if (key == "frame_opacity") m_settings.frame_opacity = std::strtof(value.c_str(), nullptr);
             else if (key == "frame_fade_seconds") m_settings.frame_fade_seconds = std::strtof(value.c_str(), nullptr);
             else if (key == "frame_single_view") m_settings.frame_single_view = on;
+            else if (key == "unvr_enabled") m_settings.unvr_enabled = on;
+            else if (key == "unvr_stereo") m_settings.unvr_stereo = on;
+            else if (key == "unvr_follow_view") m_settings.unvr_follow_view = on;
+            else if (key == "unvr_distance_m") m_settings.unvr_distance_m = std::strtof(value.c_str(), nullptr);
+            else if (key == "unvr_height_m") m_settings.unvr_height_m = std::strtof(value.c_str(), nullptr);
+            else if (key == "unvr_fade_seconds") m_settings.unvr_fade_seconds = std::strtof(value.c_str(), nullptr);
+            else if (key == "parked_unvr") unvr.active = on;
+            else if (key == "parked_unvr_screen") {
+                unvr.screen = on;
+                unvr.have_screen = true;
+            }
+            else if (key == "parked_unvr_gui") {
+                unvr.gui = on;
+                unvr.have_gui = true;
+            }
+            else if (key == "parked_unvr_roomscale") {
+                unvr.roomscale = on;
+                unvr.have_roomscale = true;
+            }
+            else if (key == "parked_unvr_distance") {
+                unvr.distance = std::strtof(value.c_str(), nullptr);
+                unvr.have_distance = true;
+            }
+            else if (key == "parked_unvr_height") {
+                unvr.height = std::strtof(value.c_str(), nullptr);
+                unvr.have_height = true;
+            }
+            else if (key == "parked_unvr_follow") {
+                unvr.follow = on;
+                unvr.have_follow = true;
+            }
+            else if (key == "parked_unvr_x") {
+                unvr.offset_x = std::strtof(value.c_str(), nullptr);
+                unvr.have_offset_x = true;
+            }
+            else if (key == "parked_unvr_y") {
+                unvr.offset_y = std::strtof(value.c_str(), nullptr);
+                unvr.have_offset_y = true;
+            }
+            else if (key == "parked_unvr_overlay") {
+                unvr.overlay = std::atoi(value.c_str());
+                unvr.have_overlay = true;
+            }
             else if (key == "parked_state") parked.active = on;
             else if (key == "parked_offsets") {
                 parked.offsets_changed = on;
@@ -742,8 +852,15 @@ private:
         m_settings.frame_surround_blue = std::clamp(m_settings.frame_surround_blue, 0.0f, 1.0f);
         m_settings.frame_opacity = std::clamp(m_settings.frame_opacity, 0.0f, 1.0f);
         m_settings.frame_fade_seconds = std::clamp(m_settings.frame_fade_seconds, 0.05f, 5.0f);
+        m_settings.unvr_distance_m = std::clamp(m_settings.unvr_distance_m, 0.5f, 8.0f);
+        m_settings.unvr_height_m = std::clamp(m_settings.unvr_height_m, 0.5f, 6.0f);
+        m_settings.unvr_fade_seconds = std::clamp(m_settings.unvr_fade_seconds, 0.10f, 0.30f);
 
         m_parked_state = parked;
+        // A reload while a screen is up must not replace the live originals.
+        if (!m_unvr_hold.active) {
+            m_parked_unvr = unvr;
+        }
 
         remember_settings_timestamp();
     }
@@ -782,7 +899,47 @@ private:
         file << "frame_opacity=" << m_settings.frame_opacity << "\n";
         file << "frame_fade_seconds=" << m_settings.frame_fade_seconds << "\n";
         file << "frame_single_view=" << (m_settings.frame_single_view ? 1 : 0) << "\n";
+        file << "unvr_enabled=" << (m_settings.unvr_enabled ? 1 : 0) << "\n";
+        file << "unvr_stereo=" << (m_settings.unvr_stereo ? 1 : 0) << "\n";
+        file << "unvr_follow_view=" << (m_settings.unvr_follow_view ? 1 : 0) << "\n";
+        file << "unvr_distance_m=" << m_settings.unvr_distance_m << "\n";
+        file << "unvr_height_m=" << m_settings.unvr_height_m << "\n";
+        file << "unvr_fade_seconds=" << m_settings.unvr_fade_seconds << "\n";
         file << "simulate_cutscene=" << (m_simulate ? 1 : 0) << "\n";
+
+        // Startup recovery has not consumed the on-disk copy yet. Keep writing
+        // that copy so an early settings save cannot drop it.
+        const UnvrJournal& unvr_journal = (!m_startup_recovery_done && m_parked_unvr.active)
+            ? m_parked_unvr
+            : m_unvr_hold;
+        file << "parked_unvr=" << (unvr_journal.active ? 1 : 0) << "\n";
+        if (unvr_journal.active && unvr_journal.have_screen) {
+            file << "parked_unvr_screen=" << (unvr_journal.screen ? 1 : 0) << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_gui) {
+            file << "parked_unvr_gui=" << (unvr_journal.gui ? 1 : 0) << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_roomscale) {
+            file << "parked_unvr_roomscale=" << (unvr_journal.roomscale ? 1 : 0) << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_distance) {
+            file << "parked_unvr_distance=" << unvr_journal.distance << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_height) {
+            file << "parked_unvr_height=" << unvr_journal.height << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_follow) {
+            file << "parked_unvr_follow=" << (unvr_journal.follow ? 1 : 0) << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_offset_x) {
+            file << "parked_unvr_x=" << unvr_journal.offset_x << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_offset_y) {
+            file << "parked_unvr_y=" << unvr_journal.offset_y << "\n";
+        }
+        if (unvr_journal.active && unvr_journal.have_overlay) {
+            file << "parked_unvr_overlay=" << unvr_journal.overlay << "\n";
+        }
 
         const bool have_parked = m_baseline.valid && m_baseline.any_changed();
         file << "parked_state=" << (have_parked ? 1 : 0) << "\n";
@@ -820,7 +977,19 @@ private:
     }
 
     bool recover_parked_state() {
+        const bool had_unvr = m_parked_unvr.active;
+        if (had_unvr && !restore_unvr_journal(m_parked_unvr)) {
+            API::get()->log_error("[CutsceneComfort] parked fixed-screen state did not restore; detection remains disabled");
+            return false;
+        }
+        m_parked_unvr = {};
+
         if (!m_parked_state.active) {
+            if (had_unvr) {
+                API::VR::save_config();
+                save_settings();
+                API::get()->log_info("[CutsceneComfort] restored fixed-screen settings after an interrupted cutscene");
+            }
             return true;
         }
 
@@ -859,6 +1028,10 @@ private:
         if (!offsets_ok || !pitch_ok || !aim_ok || !hook_ok) {
             API::get()->log_error("[CutsceneComfort] parked state recovery did not stick; detection remains disabled");
             return false;
+        }
+
+        if (had_unvr) {
+            API::get()->log_info("[CutsceneComfort] restored fixed-screen settings after an interrupted cutscene");
         }
 
         API::get()->log_info(
@@ -1038,6 +1211,45 @@ private:
 
             if (m_settings.loose_detection) {
                 ImGui::TextDisabled("careful: vehicles and turrets can trip this");
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Fixed screen during cutscenes:");
+            if (!m_unvr_support_known) {
+                ImGui::TextDisabled("Waiting for UEVR's 2D screen mode");
+            } else if (!m_unvr_supported) {
+                ImGui::TextDisabled("This UEVR build does not expose 2D screen mode");
+            } else {
+                changed |= ImGui::Checkbox("Fade to a fixed screen during cutscenes", &m_settings.unvr_enabled);
+                if (m_settings.unvr_enabled && m_settings.theater_frame) {
+                    ImGui::TextDisabled("The spatial window stays off while this is enabled");
+                }
+
+                if (m_settings.unvr_enabled) {
+                    int picture = m_settings.unvr_stereo ? 0 : 1;
+                    static const char* pictures[] = {"Stereo portal", "Flat 2D"};
+                    ImGui::SetNextItemWidth(180.0f);
+                    if (ImGui::Combo("Picture", &picture, pictures, IM_ARRAYSIZE(pictures))) {
+                        m_settings.unvr_stereo = picture == 0;
+                        changed = true;
+                    }
+                    ImGui::TextWrapped(
+                        "Stereo portal keeps the game's two eye views on UEVR's screen, so the shot still has depth. Flat 2D shows one picture to both eyes. Either way the headset stops driving the camera.");
+
+                    changed |= ImGui::Checkbox("Keep the screen in front of my view", &m_settings.unvr_follow_view);
+                    changed |= ImGui::SliderFloat("Screen distance", &m_settings.unvr_distance_m, 0.5f, 8.0f, "%.2f m");
+                    changed |= ImGui::SliderFloat("Screen height", &m_settings.unvr_height_m, 0.5f, 6.0f, "%.2f m");
+                    changed |= ImGui::SliderFloat("Fade each way", &m_settings.unvr_fade_seconds, 0.10f, 0.30f, "%.2f s");
+                    ImGui::TextDisabled("Short on purpose, so a prompt right after the scene is still readable.");
+
+                    if (ImGui::Button("Preview screen for 5 seconds")) {
+                        m_unvr_preview_until_ms = GetTickCount64() + 5000;
+                    }
+                }
+            }
+
+            if (m_unvr.phase() != comfort::UnvrPhase::Idle) {
+                ImGui::TextDisabled("%s", unvr_phase_label());
             }
 
             ImGui::Separator();
@@ -1505,7 +1717,11 @@ private:
     }
 
     void publish_frame_settings() {
-        const bool was_enabled = m_render_frame_enabled.exchange(m_settings.theater_frame);
+        // The fixed screen replaces the headset view, so the spatial mask
+        // stays down while that option is selected and the mode exists.
+        const bool fixed_screen = m_settings.unvr_enabled && m_unvr_supported;
+        const bool theater = m_settings.theater_frame && !fixed_screen;
+        const bool was_enabled = m_render_frame_enabled.exchange(theater);
         if (m_settings.theater_frame && !was_enabled) {
             request_frame_recenter();
         }
@@ -1522,6 +1738,562 @@ private:
         m_render_frame_opacity = m_settings.frame_opacity;
         m_render_frame_fade_seconds = m_settings.frame_fade_seconds;
         m_render_frame_single_view = m_settings.frame_single_view;
+    }
+
+    // ------------------------------------------------------------------
+    // Fixed screen. UEVR's 2D screen mode already drops headset position and
+    // rotation, clears the tracked view, and submits the shot as quads. The
+    // stereo portal is that mode with per-eye separation left in place. Flat
+    // 2D copies one eye's camera onto the other after UEVR has written it.
+    // ------------------------------------------------------------------
+
+    const char* unvr_phase_label() const {
+        switch (m_unvr.phase()) {
+        case comfort::UnvrPhase::FadeOutWorld: return "Fading the VR view out";
+        case comfort::UnvrPhase::Screen: return m_settings.unvr_stereo ? "Stereo portal" : "Flat 2D screen";
+        case comfort::UnvrPhase::FadeOutScreen: return "Fading the screen out";
+        case comfort::UnvrPhase::FadeInWorld: return "Fading the VR view back in";
+        case comfort::UnvrPhase::Idle: break;
+        }
+        return "";
+    }
+
+    void poll_unvr_support(float delta) {
+        if (m_unvr_support_known) {
+            return;
+        }
+
+        m_unvr_support_timer -= delta;
+        if (m_unvr_support_timer > 0.0f) {
+            return;
+        }
+        m_unvr_support_timer = 1.0f;
+
+        if (!mod_string("VR_2DScreenMode").empty()) {
+            m_unvr_supported = true;
+            m_unvr_support_known = true;
+            API::get()->log_info("[CutsceneComfort] UEVR 2D screen mode is available");
+            return;
+        }
+
+        m_unvr_support_wait += 1.0f;
+        if (m_unvr_support_wait >= 5.0f && !m_logged_unvr_missing) {
+            m_logged_unvr_missing = true;
+            API::get()->log_warn("[CutsceneComfort] VR_2DScreenMode was not found; the fixed screen stays off");
+        }
+    }
+
+    void advance_unvr(float delta) {
+        poll_unvr_support(delta);
+
+        const bool preview = GetTickCount64() < m_unvr_preview_until_ms;
+        if (m_unvr_suppress && !preview && !m_in_cutscene.load() && m_unvr.phase() == comfort::UnvrPhase::Idle) {
+            m_unvr_suppress = false;
+        }
+        const bool want = !m_unvr_suppress && m_unvr_supported && m_settings.unvr_enabled &&
+            (m_in_cutscene.load() || preview);
+        const auto step = m_unvr.update(delta, want, m_settings.unvr_fade_seconds);
+
+        if (step.fade_to_black) {
+            if (!m_unvr_hold.active && !capture_unvr_journal()) {
+                m_unvr_suppress = true;
+                API::get()->log_error("[CutsceneComfort] could not read VR_2DScreenMode; fixed screen cancelled");
+            }
+            if (m_unvr_hold.active) {
+                if (m_unvr_hold.have_roomscale) {
+                    write_mod_bool("VR_RoomscaleMovement", false);
+                }
+                start_camera_fade(current_camera_fade(0.0f), 1.0f, step.fade_seconds, true);
+                m_unvr_fade_armed = true;
+            }
+        }
+
+        if (step.apply_screen && m_unvr_hold.active) {
+            apply_unvr_screen();
+        }
+
+        if (step.release_screen) {
+            release_unvr_hold();
+        }
+
+        if (step.fade_from_black && m_unvr_fade_armed) {
+            start_camera_fade(current_camera_fade(1.0f), 0.0f, step.fade_seconds, false);
+            m_unvr_fade_armed = false;
+        }
+
+        reassert_unvr_overrides();
+    }
+
+    void reassert_unvr_overrides() {
+        if (!m_unvr_hold.active) {
+            return;
+        }
+
+        const auto phase = m_unvr.phase();
+        if (phase == comfort::UnvrPhase::Idle || phase == comfort::UnvrPhase::FadeInWorld) {
+            return;
+        }
+
+        if (m_unvr_hold.have_roomscale && read_mod_bool("VR_RoomscaleMovement") != false) {
+            write_mod_bool("VR_RoomscaleMovement", false);
+        }
+
+        if (!m_unvr_hold.screen_applied) {
+            return;
+        }
+
+        if (read_mod_bool("VR_2DScreenMode") != true) {
+            write_mod_bool("VR_2DScreenMode", true);
+        }
+        if (m_unvr_hold.have_gui && read_mod_bool("VR_EnableGUI") != true) {
+            write_mod_bool("VR_EnableGUI", true);
+        }
+
+        if (m_unvr_hold.have_distance && std::abs(m_settings.unvr_distance_m - m_unvr_applied_distance) > 0.0005f) {
+            write_mod_float("UI_Distance", m_settings.unvr_distance_m);
+            m_unvr_applied_distance = m_settings.unvr_distance_m;
+        }
+        if (m_unvr_hold.have_height && std::abs(m_settings.unvr_height_m - m_unvr_applied_height) > 0.0005f) {
+            write_mod_float("UI_Size", m_settings.unvr_height_m);
+            m_unvr_applied_height = m_settings.unvr_height_m;
+        }
+        if (m_unvr_hold.have_follow && m_settings.unvr_follow_view != m_unvr_applied_follow) {
+            write_mod_bool("UI_FollowView", m_settings.unvr_follow_view);
+            m_unvr_applied_follow = m_settings.unvr_follow_view;
+        }
+
+        m_unvr_flatten_stereo.store(!m_settings.unvr_stereo);
+    }
+
+    bool capture_unvr_journal() {
+        UnvrJournal next{};
+        if (!read_mod_bool_into("VR_2DScreenMode", next.have_screen, next.screen) || !next.have_screen) {
+            return false;
+        }
+
+        read_mod_bool_into("VR_EnableGUI", next.have_gui, next.gui);
+        read_mod_bool_into("VR_RoomscaleMovement", next.have_roomscale, next.roomscale);
+        read_mod_float_into("UI_Distance", next.have_distance, next.distance);
+        read_mod_float_into("UI_Size", next.have_height, next.height);
+        read_mod_bool_into("UI_FollowView", next.have_follow, next.follow);
+        read_mod_float_into("UI_X_Offset", next.have_offset_x, next.offset_x);
+        read_mod_float_into("UI_Y_Offset", next.have_offset_y, next.offset_y);
+        read_mod_int_into("UI_OverlayType", next.have_overlay, next.overlay);
+        next.active = true;
+        m_unvr_hold = next;
+        save_settings();
+        return true;
+    }
+
+    void apply_unvr_screen() {
+        write_mod_bool("VR_2DScreenMode", true);
+        if (m_unvr_hold.have_gui) {
+            write_mod_bool("VR_EnableGUI", true);
+        }
+        if (m_unvr_hold.have_distance) {
+            write_mod_float("UI_Distance", m_settings.unvr_distance_m);
+            m_unvr_applied_distance = m_settings.unvr_distance_m;
+        }
+        if (m_unvr_hold.have_height) {
+            write_mod_float("UI_Size", m_settings.unvr_height_m);
+            m_unvr_applied_height = m_settings.unvr_height_m;
+        }
+        if (m_unvr_hold.have_follow) {
+            write_mod_bool("UI_FollowView", m_settings.unvr_follow_view);
+            m_unvr_applied_follow = m_settings.unvr_follow_view;
+        }
+        if (m_unvr_hold.have_offset_x) {
+            write_mod_float("UI_X_Offset", 0.0f);
+        }
+        if (m_unvr_hold.have_offset_y) {
+            write_mod_float("UI_Y_Offset", 0.0f);
+        }
+        if (m_unvr_hold.have_overlay) {
+            write_mod_int("UI_OverlayType", 0);
+        }
+
+        m_unvr_hold.screen_applied = true;
+        m_unvr_flatten_stereo.store(!m_settings.unvr_stereo);
+        API::get()->log_info("[CutsceneComfort] fixed screen up (%s), fade %.2fs",
+            m_settings.unvr_stereo ? "stereo portal" : "flat 2D", m_settings.unvr_fade_seconds);
+    }
+
+    void release_unvr_hold() {
+        m_unvr_flatten_stereo.store(false);
+
+        if (!m_unvr_hold.active) {
+            return;
+        }
+
+        const bool restored = restore_unvr_journal(m_unvr_hold);
+        m_unvr_hold.screen_applied = false;
+        if (!restored) {
+            API::get()->log_error("[CutsceneComfort] fixed-screen restore did not stick; the journal is kept");
+            save_settings();
+            return;
+        }
+
+        API::VR::save_config();
+        m_pending_uevr_save = false;
+        m_unvr_hold = {};
+        save_settings();
+        API::get()->log_info("[CutsceneComfort] fixed screen released");
+    }
+
+    bool restore_unvr_journal(const UnvrJournal& journal) {
+        if (!journal.active) {
+            return true;
+        }
+        if (!journal.usable()) {
+            return false;
+        }
+
+        bool ok = true;
+        if (journal.have_screen) {
+            ok = write_mod_bool("VR_2DScreenMode", journal.screen) && ok;
+        }
+        if (journal.have_gui) {
+            ok = write_mod_bool("VR_EnableGUI", journal.gui) && ok;
+        }
+        if (journal.have_roomscale) {
+            ok = write_mod_bool("VR_RoomscaleMovement", journal.roomscale) && ok;
+        }
+        if (journal.have_distance) {
+            ok = write_mod_float("UI_Distance", journal.distance) && ok;
+        }
+        if (journal.have_height) {
+            ok = write_mod_float("UI_Size", journal.height) && ok;
+        }
+        if (journal.have_follow) {
+            ok = write_mod_bool("UI_FollowView", journal.follow) && ok;
+        }
+        if (journal.have_offset_x) {
+            ok = write_mod_float("UI_X_Offset", journal.offset_x) && ok;
+        }
+        if (journal.have_offset_y) {
+            ok = write_mod_float("UI_Y_Offset", journal.offset_y) && ok;
+        }
+        if (journal.have_overlay) {
+            ok = write_mod_int("UI_OverlayType", journal.overlay) && ok;
+        }
+        return ok;
+    }
+
+    static std::string mod_string(const char* key) {
+        return API::VR::get_mod_value<std::string>(key);
+    }
+
+    static bool mod_is_true(const std::string& value) {
+        return value == "true" || value == "1";
+    }
+
+    static bool read_mod_bool(const char* key) {
+        return mod_is_true(mod_string(key));
+    }
+
+    static bool read_mod_bool_into(const char* key, bool& have, bool& dest) {
+        const auto value = mod_string(key);
+        if (value.empty()) {
+            have = false;
+            return false;
+        }
+        have = true;
+        dest = mod_is_true(value);
+        return true;
+    }
+
+    static bool read_mod_float_into(const char* key, bool& have, float& dest) {
+        const auto value = mod_string(key);
+        if (value.empty()) {
+            have = false;
+            return false;
+        }
+        char* end = nullptr;
+        const auto parsed = std::strtof(value.c_str(), &end);
+        if (end == value.c_str() || !std::isfinite(parsed)) {
+            have = false;
+            return false;
+        }
+        have = true;
+        dest = parsed;
+        return true;
+    }
+
+    static bool read_mod_int_into(const char* key, bool& have, int& dest) {
+        const auto value = mod_string(key);
+        if (value.empty()) {
+            have = false;
+            return false;
+        }
+        char* end = nullptr;
+        const auto parsed = std::strtol(value.c_str(), &end, 10);
+        if (end == value.c_str()) {
+            have = false;
+            return false;
+        }
+        have = true;
+        dest = static_cast<int>(parsed);
+        return true;
+    }
+
+    static bool write_mod_bool(const char* key, bool value) {
+        API::VR::set_mod_value(key, value);
+        const auto after = mod_string(key);
+        return !after.empty() && mod_is_true(after) == value;
+    }
+
+    static bool write_mod_float(const char* key, float value) {
+        API::VR::set_mod_value(key, value);
+        const auto after = mod_string(key);
+        if (after.empty()) {
+            return false;
+        }
+        char* end = nullptr;
+        const auto parsed = std::strtof(after.c_str(), &end);
+        return end != after.c_str() && std::abs(parsed - value) <= 0.02f;
+    }
+
+    static bool write_mod_int(const char* key, int value) {
+        API::VR::set_mod_value(key, value);
+        const auto after = mod_string(key);
+        if (after.empty()) {
+            return false;
+        }
+        return std::atoi(after.c_str()) == value;
+    }
+
+    static std::wstring clean_fname(const std::wstring& value) {
+        auto name = value;
+        while (!name.empty() && name.back() == L'\0') {
+            name.pop_back();
+        }
+        return name;
+    }
+
+    float current_camera_fade(float fallback) {
+        const auto manager = camera_manager();
+        if (manager == nullptr) {
+            return fallback;
+        }
+
+        const auto amount = manager->get_property_data<float>(L"FadeAmount");
+        if (amount == nullptr || !std::isfinite(*amount)) {
+            return fallback;
+        }
+        return std::clamp(*amount, 0.0f, 1.0f);
+    }
+
+    API::UObject* camera_manager() {
+        const auto controller = API::get()->get_player_controller(0);
+        if (controller == nullptr) {
+            return nullptr;
+        }
+
+        const auto slot = controller->get_property_data<API::UObject*>(L"PlayerCameraManager");
+        if (slot == nullptr || *slot == nullptr) {
+            return nullptr;
+        }
+        if (!API::UObjectHook::exists(*slot)) {
+            return nullptr;
+        }
+        return *slot;
+    }
+
+    API::UFunction* find_fade_function(API::UClass* cls) {
+        int depth = 0;
+        for (API::UStruct* type = cls; type != nullptr && depth < 64; type = type->get_super_struct(), ++depth) {
+            if (auto* function = type->find_function(L"StartCameraFade")) {
+                return function;
+            }
+        }
+        return nullptr;
+    }
+
+    template <typename Visitor>
+    void for_each_property(API::UStruct* type, Visitor&& visitor) {
+        if (type == nullptr) {
+            return;
+        }
+
+        if (auto* field = type->get_child_properties()) {
+            for (; field != nullptr; field = field->get_next()) {
+                visitor(static_cast<API::FProperty*>(field));
+            }
+            return;
+        }
+
+        for (auto* child = type->get_children(); child != nullptr; child = child->get_next()) {
+            visitor(static_cast<API::FProperty*>(child));
+        }
+    }
+
+    void start_camera_fade(float from_alpha, float to_alpha, float duration, bool hold) {
+        if (m_fade_unavailable) {
+            return;
+        }
+
+        const auto manager = camera_manager();
+        if (manager == nullptr || manager->get_class() == nullptr) {
+            return;
+        }
+
+        auto* function = find_fade_function(manager->get_class());
+        if (function == nullptr) {
+            m_fade_unavailable = true;
+            if (!m_logged_fade_failure) {
+                m_logged_fade_failure = true;
+                API::get()->log_warn("[CutsceneComfort] PlayerCameraManager has no StartCameraFade; the screen switch will not fade");
+            }
+            return;
+        }
+
+        const auto size = function->get_properties_size();
+        if (size <= 0 || size > 1024) {
+            m_fade_unavailable = true;
+            if (!m_logged_fade_failure) {
+                m_logged_fade_failure = true;
+                API::get()->log_warn("[CutsceneComfort] StartCameraFade has an unexpected parameter block");
+            }
+            return;
+        }
+
+        std::vector<unsigned char> params(static_cast<size_t>(size), 0);
+        bool have_from = false;
+        bool have_to = false;
+        bool have_duration = false;
+        bool have_color = false;
+        bool have_hold = false;
+
+        auto write_number = [&](int offset, bool as_double, float value) {
+            if (offset < 0 || offset >= size) {
+                return;
+            }
+            auto* dest = params.data() + offset;
+            if (as_double) {
+                const double wide = value;
+                if (offset + static_cast<int>(sizeof(wide)) <= size) {
+                    std::memcpy(dest, &wide, sizeof(wide));
+                }
+            } else if (offset + static_cast<int>(sizeof(value)) <= size) {
+                std::memcpy(dest, &value, sizeof(value));
+            }
+        };
+
+        for_each_property(function, [&](API::FProperty* prop) {
+            if (prop == nullptr || prop->get_fname() == nullptr) {
+                return;
+            }
+
+            const auto name = clean_fname(prop->get_fname()->to_string());
+            const auto klass = prop->get_class() != nullptr ? clean_fname(prop->get_class()->get_name()) : std::wstring{};
+            const auto offset = prop->get_offset();
+            const bool as_double = klass.find(L"Double") != std::wstring::npos;
+
+            if (name == L"FromAlpha") {
+                write_number(offset, as_double, from_alpha);
+                have_from = true;
+            } else if (name == L"ToAlpha") {
+                write_number(offset, as_double, to_alpha);
+                have_to = true;
+            } else if (name == L"Duration") {
+                write_number(offset, as_double, duration);
+                have_duration = true;
+            } else if (name == L"Color") {
+                have_color = write_fade_color(prop, klass, params, offset);
+            } else if (name == L"bShouldFadeAudio") {
+                set_param_bool(prop, klass, params, offset, false);
+            } else if (name == L"bHoldWhenFinished") {
+                have_hold = set_param_bool(prop, klass, params, offset, hold);
+            }
+        });
+
+        if (!have_from || !have_to || !have_duration || !have_color || !have_hold) {
+            m_fade_unavailable = true;
+            if (!m_logged_fade_failure) {
+                m_logged_fade_failure = true;
+                API::get()->log_warn(
+                    "[CutsceneComfort] StartCameraFade is missing a parameter (from %d to %d duration %d color %d hold %d)",
+                    have_from ? 1 : 0, have_to ? 1 : 0, have_duration ? 1 : 0, have_color ? 1 : 0, have_hold ? 1 : 0);
+            }
+            return;
+        }
+
+        if (!m_logged_fade_layout) {
+            m_logged_fade_layout = true;
+            API::get()->log_info("[CutsceneComfort] StartCameraFade bound (%d byte parameter block)", size);
+        }
+
+        manager->process_event(function, params.data());
+    }
+
+    bool write_fade_color(API::FProperty* prop, const std::wstring& klass, std::vector<unsigned char>& params, int offset) {
+        const auto size = static_cast<int>(params.size());
+        if (offset < 0 || offset >= size) {
+            return false;
+        }
+
+        if (klass.find(L"Struct") != std::wstring::npos) {
+            auto* script = static_cast<API::FStructProperty*>(prop)->get_struct();
+            bool wrote_any = false;
+            bool wrote_alpha = false;
+            for_each_property(script, [&](API::FProperty* member) {
+                if (member == nullptr || member->get_fname() == nullptr) {
+                    return;
+                }
+                const auto member_name = clean_fname(member->get_fname()->to_string());
+                const auto member_class = member->get_class() != nullptr
+                    ? clean_fname(member->get_class()->get_name())
+                    : std::wstring{};
+                float component = 0.0f;
+                if (member_name == L"A") {
+                    component = 1.0f;
+                } else if (member_name != L"R" && member_name != L"G" && member_name != L"B") {
+                    return;
+                }
+
+                const auto member_offset = offset + member->get_offset();
+                const bool as_double = member_class.find(L"Double") != std::wstring::npos;
+                bool wrote = false;
+                if (as_double) {
+                    const double wide = component;
+                    if (member_offset >= 0 && member_offset + static_cast<int>(sizeof(wide)) <= size) {
+                        std::memcpy(params.data() + member_offset, &wide, sizeof(wide));
+                        wrote = true;
+                    }
+                } else if (member_offset >= 0 && member_offset + static_cast<int>(sizeof(component)) <= size) {
+                    std::memcpy(params.data() + member_offset, &component, sizeof(component));
+                    wrote = true;
+                }
+                if (wrote) {
+                    wrote_any = true;
+                    if (member_name == L"A") {
+                        wrote_alpha = true;
+                    }
+                }
+            });
+            if (wrote_any && wrote_alpha) {
+                return true;
+            }
+        }
+
+        // FLinearColor is four floats, R G B A, when the struct members are
+        // not reflected individually.
+        if (offset + static_cast<int>(sizeof(float) * 4) > size) {
+            return false;
+        }
+        const float rgba[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        std::memcpy(params.data() + offset, rgba, sizeof(rgba));
+        return true;
+    }
+
+    bool set_param_bool(API::FProperty* prop, const std::wstring& klass, std::vector<unsigned char>& params,
+        int offset, bool value) {
+        if (klass.find(L"Bool") == std::wstring::npos || offset < 0 || offset >= static_cast<int>(params.size())) {
+            return false;
+        }
+
+        static_cast<API::FBoolProperty*>(prop)->set_value_in_propbase(params.data() + offset, value);
+        return true;
     }
 
     // Rolling average of what our tick work costs, for the UI readout.
@@ -1698,6 +2470,49 @@ private:
     std::atomic<bool> m_logged_frame_param_failure{false};
     std::atomic<bool> m_operator_window_bridge_available{false};
 
+    // Originals for every UEVR setting the fixed screen touches. Kept in the
+    // ini so a kill during the scene can put them back on the next launch.
+    struct UnvrJournal {
+        bool active{false};
+        bool screen{false};
+        bool have_screen{false};
+        bool gui{true};
+        bool have_gui{false};
+        bool roomscale{false};
+        bool have_roomscale{false};
+        float distance{2.0f};
+        bool have_distance{false};
+        float height{1.5f};
+        bool have_height{false};
+        bool follow{false};
+        bool have_follow{false};
+        float offset_x{0.0f};
+        bool have_offset_x{false};
+        float offset_y{0.0f};
+        bool have_offset_y{false};
+        int overlay{0};
+        bool have_overlay{false};
+        bool screen_applied{false};
+
+        bool usable() const {
+            if (!active) {
+                return true;
+            }
+            if (!have_screen) {
+                return false;
+            }
+
+            auto finite_if = [](bool have, float value) {
+                return !have || std::isfinite(value);
+            };
+            return finite_if(have_distance, distance) &&
+                finite_if(have_height, height) &&
+                finite_if(have_offset_x, offset_x) &&
+                finite_if(have_offset_y, offset_y) &&
+                (!have_overlay || (overlay >= 0 && overlay <= 3));
+        }
+    };
+
     struct ParkedState {
         float forward{};
         float right{};
@@ -1730,6 +2545,35 @@ private:
                 (!aim_changed || (aim >= 0 && aim <= 3));
         }
     } m_parked_state{};
+
+    comfort::UnvrTransition m_unvr{};
+    UnvrJournal m_unvr_hold{};
+    UnvrJournal m_parked_unvr{};
+    std::atomic<bool> m_unvr_flatten_stereo{false};
+    bool m_unvr_fade_armed{false};
+    bool m_unvr_suppress{false};
+    bool m_unvr_supported{false};
+    bool m_unvr_support_known{false};
+    bool m_logged_unvr_missing{false};
+    bool m_pending_uevr_save{false};
+    bool m_fade_unavailable{false};
+    bool m_logged_fade_failure{false};
+    bool m_logged_fade_layout{false};
+    float m_unvr_support_timer{0.0f};
+    float m_unvr_support_wait{0.0f};
+    float m_unvr_applied_distance{0.0f};
+    float m_unvr_applied_height{0.0f};
+    bool m_unvr_applied_follow{true};
+    uint64_t m_unvr_preview_until_ms{0};
+
+    struct MonoAnchor {
+        bool valid{false};
+        bool is_double{false};
+        int view_index{-1};
+        double x{0.0};
+        double y{0.0};
+        double z{0.0};
+    } m_mono_anchor{};
 
     float m_settings_poll_timer{0.0f};
     bool m_have_settings_timestamp{false};

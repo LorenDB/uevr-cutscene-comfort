@@ -38,9 +38,47 @@ launch before detection resumes. Once restoration finishes, the verified
 baseline is also saved back through UEVR before the recovery journal is
 cleared, so a later clean launch cannot resurrect temporary cutscene values.
 
+## Fixed screen during cutscenes
+
+Optional, and off until you enable it. When a cutscene is detected the
+headset view fades to black, then comes back as UEVR's 2D screen: a quad
+in front of you, with the game camera no longer following the headset.
+When the cutscene ends, the screen fades to black and the tracked VR view
+fades back in.
+
+The fade uses the engine camera fade (`StartCameraFade`), so the mode
+change happens while the picture is black. Each half defaults to 0.15
+seconds and can be set from 0.10 to 0.30 seconds. That keeps the change
+visible and still short enough that a prompt immediately after the scene
+is readable.
+
+Two pictures are available:
+
+- **Stereo portal** (the default) is UEVR's 2D screen as it already works
+  on OpenXR. Each eye keeps its own view, so the quad has depth, and the
+  headset pose is not applied to the camera.
+- **Flat 2D** feeds both eyes the same camera position, so the quad is a
+  single picture.
+
+The screen distance and height are UEVR's UI distance and UI size for the
+duration of the scene. "Keep the screen in front of my view" turns on
+UEVR's follow-view placement and centers the quad; your previous UI
+placement is restored afterwards. Roomscale movement is held off for the
+same span so walking around does not move the character, and it is
+restored with the other values. If UEVR's GUI toggle was off, it is
+turned on so the quad is submitted, then restored.
+
+The originals are journaled in `cutscene_comfort.ini` before anything is
+changed. A crash mid-scene restores them on the next launch, then asks
+UEVR to save that restored config.
+
+This path uses stock UEVR. It does not need the Operator fork. Preview
+runs the same fade for five seconds without waiting for a real cutscene.
+
 ## Fixed 6DOF cutscene window
 
-Optional and off by default. When a cutscene begins, the plugin captures a
+Optional and off by default. While the fixed screen above is enabled, this
+window stays off. When a cutscene begins, the plugin captures a
 tracking-space anchor and places the visible scene in a physical aperture in
 front of that anchor. The aperture does not get re-centered every frame. You
 can translate or turn your head and look at it from another angle while the

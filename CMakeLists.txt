@@ -76,4 +76,12 @@ if(BUILD_TESTING)
     target_compile_definitions(CutsceneComfortShaderTest PRIVATE NOMINMAX)
     target_link_libraries(CutsceneComfortShaderTest PRIVATE d3dcompiler)
     add_test(NAME CutsceneComfort.ShaderCompile COMMAND CutsceneComfortShaderTest)
+
+    add_executable(CutsceneComfortUnvrTest
+        tests/UnvrTransitionTest.cpp
+    )
+    target_include_directories(CutsceneComfortUnvrTest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME CutsceneComfort.UnvrTransition COMMAND CutsceneComfortUnvrTest)
 endif()

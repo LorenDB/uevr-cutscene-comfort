@@ -23,4 +23,11 @@ frame_surround_blue=0.0
 frame_opacity=1.0
 frame_fade_seconds=0.6
 frame_single_view=0
+# Fixed screen. Off until enabled. Stereo portal is the default picture.
+unvr_enabled=0
+unvr_stereo=1
+unvr_follow_view=1
+unvr_distance_m=2.0
+unvr_height_m=1.5
+unvr_fade_seconds=0.15
 simulate_cutscene=0
